@@ -28,6 +28,69 @@
 ; THE SOFTWARE.
 */
 
+2016-03-14 2.8.5       Firmware 2.8.5 SIM808 GSM/GPS module support
+                       # Fix for Twizy build w/o BATTMON
+                       # Twizy: ideal range calculated with temperature influence approximation
+                       # Twizy: Battery capacity estimation
+                       # Twizy: Charge start restarts SOC window (to get most recent BMS SOC)
+                       # Twizy: Charge interruption no longer restarts power sums & SOC window
+                       # Added vehicle_version to net msg "F"
+                       # New vehicle: Kia Soul EV, initial version 0.1 (alpha/untested)
+                       # Kia Soul: VIN, car status, doors & charging status, SOC, estimated range, speed
+                       # Framework: OBDII polling support for modes 02, 10 & 21
+                       # Kia Soul: DEBUG diag output fixed for SMS size limit
+                       # Kia Soul: ISR optimization - OBD diag data init & length debugging
+                       # Kia Soul: Buffer overflow protection for OBDII multi frame polls
+                       # Kia Soul: Init CAN RX filter 1 to avoid noise triggers
+                       # Twizy: optional current limit modification
+                       # Added compiler switch OVMS_NO_CRASHDEBUG
+                       # Twizy V3.7.0: - CFG POWER: max current control, higher torque & power levels
+                       # Framework v2.8.2: DIAG mode: support backspace & ctrl-a / ctrl-c (= abort/clear)
+                       # Framework v2.8.2: DIAG mode perl clients added
+                       # Framework v2.8.2: DIAG mode documentation extended
+                       # Add hints on 0x100/0x96 and 0x400/0x01
+                       # Framework: Fixed base64decode(), removed bug workarounds
+                       # Framework: base64encode(): return pointer to end of base64 string
+                       # Framework: New net_assert_caller(): check caller, fallback to REGPHONE
+                       # Framework: net_put RAM redirection now uses net_buf[]
+                       # Framework: Code cleanup, size and stack depth optimization
+                       # Framework: Fix: stack overflow/underflow flags cleared after crash
+                       # Framework: Perl diagmode clients: missing license info added
+                       # Twizy: Flux map optimization
+                       # Twizy: Fix: "CA?" outputs ETR SOC if ETR range is zero
+                       # Twizy: CAN control bits to disable emergency reset, kickdown & autopower
+                       # Twizy: Flux & saturation maps added to documentation
+                       # Twizy: Updated SDO list & limits
+                       # MPLABX 3.1x support, and OVMS_BUILDCONFIG to show selected build config in version strings
+                       # Add pics and docs on Tesla Model S new style DIAG connector seen in late 2015 cars onwards
+                       # Re-work GPS initialisation for SIM808
+                       # Use AT+CGPSRST=0 for cold start of GPS
+                       # Fix SMS VERSION command
+
+2014-09-23 2.8.1       Firmware 2.8.1
+                       # Full build for twizzy, in production (include CFG and BATTMON)
+                       # Make COPS more lenient.
+                       # Support GPRS DNS configuration via parameter #
+                       # Permit compilation of vehicle_twizy without OVMS_TWIZY_BATTMON
+                       # Require car_time for vehicle_track.c
+                       # Hook-in for vehicle_obdii
+                       # Update default QC server IP to 54.197.255.127
+                       # Twizy V3.6.1
+                       # Nissan Leaf on EVCAN bus, and enhancements to vehicle code to support
+                       # Include charge status in DIAG
+                       # Revision to SOC and idealrange calculations, from Tom Saxtons suggestions
+                       # Fixed D msg trip/odometer output conversion
+                       # Consistency fix: new STAT ranges converted to user units
+                       # Comments regarding 104.8576ms timer1
+                       # Precision changes to led_carticker (ovms mailing list subject "Tick math" October 2014)
+                       # First implemention of net_fnbits NET_FN_CARTIME
+                       # carbit feature FEATURE_CB_SSMSTIME to allow suppress sms time comments
+                       # Allow ACC acc_handle_msg to choose to handle a particular message
+                       # Include timezone in time shown in sms responses
+                       # Make ALL sms responses include time, if possible
+                       # SMS "MODULE?" output in "MODULE" parameter order (user suggestion)
+                       # And a host of other small changes (including a lot of twizzy work)
+
 2014-03-10 2.6.5       Firmware 2.6.5
                        # Change car_tmotor to signed int
                        # Call vehicle_fn_poll0() in OVMS_POLLER, if no poll list defined

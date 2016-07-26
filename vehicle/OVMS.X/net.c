@@ -88,22 +88,25 @@ char net_buf[NET_BUF_MAX];                  // The network buffer itself
 
 #ifdef OVMS_INTERNALGPS
 // Using internal SIM908 GPS:
-rom char NET_INIT1[] = "AT+CGPSPWR=1;+CGPSRST=0;+CSMINS?\r";
+rom char NET_WAKEUP_GPSON[] = "AT+CGPSPWR=1\r";
+rom char NET_WAKEUP_GPSOFF[] = "AT+CGPSPWR=0\r";
 rom char NET_REQGPS[] = "AT+CGPSINF=2;+CGPSINF=64;+CGPSPWR=1\r";
+rom char NET_INIT1_GPSON[] = "AT+CGPSRST=0;+CSMINS?\r";
 #else
 // Using external GPS from car:
-rom char NET_INIT1[] = "AT+CSMINS?\r";
+rom char NET_WAKEUP[] = "AT\r";
 #endif
 
+rom char NET_INIT1[] = "AT+CSMINS?\r";
 rom char NET_INIT2[] = "AT+CCID;+CPBF=\"O-\";+CPIN?\r";
 rom char NET_INIT3[] = "AT+IPR?;+CREG=1;+CLIP=1;+CMGF=1;+CNMI=2,2;+CSDH=1;+CIPSPRT=0;+CIPQSEND=1;+CLTS=1;E0\r";
 //rom char NET_INIT3[] = "AT+IPR?;+CREG=1;+CLIP=1;+CMGF=1;+CNMI=2,2;+CSDH=1;+CIPSPRT=0;+CIPQSEND=1;+CLTS=1;E1\r";
 // NOTE: changing IP mode to QSEND=0 needs handling change for "SEND OK"/"DATA ACCEPT" in net_state_activity()
 rom char NET_COPS[] = "AT+COPS=0,1;+COPS?\r";
 
-rom char NET_WAKEUP[] = "AT\r";
 rom char NET_HANGUP[] = "ATH\r";
 rom char NET_CREG_CIPSTATUS[] = "AT+CREG?;+CIPSTATUS;+CCLK?;+CSQ\r";
+rom char NET_CREG_STATUS[] = "AT+CREG?\r";
 rom char NET_IPR_SET[] = "AT+IPR=9600\r"; // sets fixed baud rate for the modem
 
 ////////////////////////////////////////////////////////////////////////
@@ -143,6 +146,22 @@ void net_reset_async(void)
   vUARTIntStatus.UARTIntRxError = 0;
   }
 
+
+////////////////////////////////////////////////////////////////////////
+// net_assert_caller():
+// check for valid (non empty) caller, fallback to PARAM_REGPHONE
+//
+char *net_assert_caller(char *caller)
+  {
+  if (!caller || !*caller)
+    {
+    strcpy(net_caller, par_get(PARAM_REGPHONE));
+    return(net_caller);
+    }
+  return caller;
+  }
+
+
 ////////////////////////////////////////////////////////////////////////
 // net_poll()
 // This function is an entry point from the main() program loop, and
@@ -168,8 +187,22 @@ void net_poll(void)
       if ((net_state==NET_STATE_FIRSTRUN)||(net_state==NET_STATE_DIAGMODE))
         {
         // Special handling in FIRSTRUN and DIAGMODE
-        if (x == 0x0a) continue; // Skip 0x0a (LF)
-        if (x == 0x0d) x=0x0a; // Treat CR as LF
+        if (x == 0x0a) // Skip 0x0a (LF)
+          continue;
+        else if (x == 0x0d) // Treat CR as LF
+          x = 0x0a;
+        else if (x == 0x08 && net_buf_pos > 0) // Backspace
+          {
+          net_buf[--net_buf_pos] = 0;
+          continue;
+          }
+        else if (x == 0x01 || x == 0x03) // Ctrl-A / Ctrl-C
+          {
+          net_buf_pos = 0;
+          net_buf[0] = 0;
+          net_puts_rom("\r\n");
+          continue;
+          }
         }
       if (x == 0x0d) continue; // Skip 0x0d (CR)
       net_buf[net_buf_pos++] = x;
@@ -275,9 +308,17 @@ void net_poll(void)
 
 void net_puts_rom(const rom char *data)
   {
+  
+  if (net_msg_bufpos)
+    {
+    // NET SMS wrapper mode: (189 byte = max MP payload)
+    for (;*data && (net_msg_bufpos < (net_buf+189));data++)
+      *net_msg_bufpos++ = *data;
+    }
+
 #ifdef OVMS_DIAGMODULE
   // Help diag terminals with line breaks
-  if ( net_state == NET_STATE_DIAGMODE )
+  else if ( net_state == NET_STATE_DIAGMODE )
     {
     char lastdata = 0;
 
@@ -297,12 +338,14 @@ void net_puts_rom(const rom char *data)
       lastdata = *data++;
       }
     }
-  else
 #endif // OVMS_DIAGMODULE
 
-  // Send characters up to the null
-  for (;*data;data++)
-    UART_WAIT_PUTC(*data)
+  else
+    {
+    // Send characters up to the null
+    for (;*data;data++)
+      UART_WAIT_PUTC(*data)
+    }
   }
 
 ////////////////////////////////////////////////////////////////////////
@@ -312,9 +355,17 @@ void net_puts_rom(const rom char *data)
 //
 void net_puts_ram(const char *data)
   {
+
+  if (net_msg_bufpos)
+    {
+    // NET SMS wrapper mode: (189 byte = max MP payload)
+    for (;*data && (net_msg_bufpos < (net_buf+189));data++)
+      *net_msg_bufpos++ = *data;
+    }
+
 #ifdef OVMS_DIAGMODULE
   // Help diag terminals with line breaks
-  if( net_state == NET_STATE_DIAGMODE )
+  else if( net_state == NET_STATE_DIAGMODE )
     {
     char lastdata = 0;
 
@@ -334,12 +385,14 @@ void net_puts_ram(const char *data)
       lastdata = *data++;
       }
     }
-  else
 #endif // OVMS_DIAGMODULE
 
-  // Send characters up to the null
-  for (;*data;data++)
-    UART_WAIT_PUTC(*data)
+  else
+    {
+    // Send characters up to the null
+    for (;*data;data++)
+      UART_WAIT_PUTC(*data)
+    }
   }
 
 ////////////////////////////////////////////////////////////////////////
@@ -348,8 +401,17 @@ void net_puts_ram(const char *data)
 // N.B. This may block if the transmit buffer is full.
 void net_putc_ram(const char data)
   {
-  // Send one character
-  UART_WAIT_PUTC(data)
+  if (net_msg_bufpos)
+    {
+    // NET SMS wrapper mode: (189 byte = max MP payload)
+    if (net_msg_bufpos < (net_buf+189))
+      *net_msg_bufpos++ = data;
+    }
+  else
+    {
+    // Send one character
+    UART_WAIT_PUTC(data)
+    }
   }
 
 ////////////////////////////////////////////////////////////////////////
@@ -392,7 +454,7 @@ void net_req_notification_error(unsigned int errorcode, unsigned long errordata)
 //
 void net_req_notification(unsigned int notify)
   {
-  char *p,*q;
+  char *p;
   p = par_get(PARAM_NOTIFIES);
   if (strstrrampgm(p,(char const rom far*)"SMS") != NULL)
     {
@@ -405,9 +467,15 @@ void net_req_notification(unsigned int notify)
   }
 
 ////////////////////////////////////////////////////////////////////////
-// net_phonebook
-// A phonebook entry has arrived, and the parameters may need to be
-// updated...
+// net_phonebook: SIM phonebook auto provisioning system
+//
+// Usage:
+// Create phonebook entries like "O-8-MYVEHICLEID", "O-5-APN", etc.
+// The O- prefix tells us this is OVMS, the next number is the parameter
+// number to set, and the remainder is the value.
+// This is very flexible, but the textual fields are limited in length
+// (typically 16 characters or so).
+// 
 void net_phonebook(char *pb)
   {
   // We have a phonebook entry line from the SIM card / modem
@@ -454,10 +522,17 @@ void net_state_enter(unsigned char newstate)
   {
   char *p;
 
+// Enable for debugging (via serial port) of state transitions
+//  p = stp_x(net_scratchpad, "\r\n# ST-ENTER: ", newstate);
+//  p = stp_rom(p, "\r\n");
+//  net_puts_ram(net_scratchpad);
+//  delay100(1);
+  
   net_state = newstate;
   switch(net_state)
     {
     case NET_STATE_FIRSTRUN:
+      net_msg_bufpos = NULL;
       net_timeout_rxdata = NET_RXDATA_TIMEOUT;
       led_set(OVMS_LED_GRN,OVMS_LED_ON);
       led_set(OVMS_LED_RED,OVMS_LED_ON);
@@ -520,7 +595,20 @@ void net_state_enter(unsigned char newstate)
       net_timeout_goto = NET_STATE_HARDRESET;
       net_timeout_ticks = 95;
       net_state_vchar = 0;
+#ifdef OVMS_INTERNALGPS
+      // Using internal SIMx08 GPS:
+      if ((net_fnbits & NET_FN_INTERNALGPS) != 0)
+        {
+        net_puts_rom(NET_INIT1_GPSON);
+        }
+      else
+        {
+        net_puts_rom(NET_INIT1);
+        }
+#else
+      // Using external GPS from car:
       net_puts_rom(NET_INIT1);
+#endif
       break;
     case NET_STATE_DOINIT2:
       led_set(OVMS_LED_GRN,NET_LED_INITSIM2);
@@ -616,7 +704,7 @@ void net_state_enter(unsigned char newstate)
       led_set(OVMS_LED_RED,OVMS_LED_OFF);
       delay100(2);
       net_timeout_goto = NET_STATE_HARDRESET;
-      net_timeout_ticks = 240;
+      net_timeout_ticks = 120;
       net_msg_disconnected();
       p = par_get(PARAM_GSMLOCK);
       if (*p==0)
@@ -638,7 +726,7 @@ void net_state_enter(unsigned char newstate)
       led_set(OVMS_LED_GRN,NET_LED_COPS);
       led_set(OVMS_LED_RED,OVMS_LED_OFF);
       net_timeout_goto = NET_STATE_COPSWDONE;
-      net_timeout_ticks = 30;
+      net_timeout_ticks = 300;
       break;
     case NET_STATE_COPSWDONE:
       if (net_cops_tries++ < 20)
@@ -677,7 +765,7 @@ void net_state_activity()
       led_set(OVMS_LED_RED,OVMS_LED_OFF);
     }
     CHECKPOINT(0x36)
-    net_sms_in(net_caller,net_buf,net_buf_pos);
+    net_sms_in(net_caller,net_buf);
     CHECKPOINT(0x35)
     return;
     }
@@ -871,6 +959,17 @@ void net_state_activity()
             break;
           case NETINIT_CIFSR:
             net_puts_rom("AT+CIFSR\r");
+            break;
+          case NETINIT_CDNSCFG:
+            b = par_get(PARAM_GPRSDNS);
+            if (*b == 0)
+              net_puts_rom("AT\r");
+            else
+              {
+              net_puts_rom("AT+CDNSCFG=\"");
+              net_puts_ram(b);
+              net_puts_rom("\"\r");
+              }
             break;
           case NETINIT_CLPORT:
             net_puts_rom("AT+CLPORT=\"TCP\",\"6867\"\r");
@@ -1144,7 +1243,7 @@ void net_state_activity()
 void net_state_ticker1(void)
   {
   char stat;
-  char *p;
+  char cmd[5];
 
   CHECKPOINT(0x38)
 
@@ -1166,7 +1265,20 @@ void net_state_ticker1(void)
         // We are about to timeout, so let's set the error code...
         led_set(OVMS_LED_RED,NET_LED_ERRMODEM);
         }
+#ifdef OVMS_INTERNALGPS
+      // Using internal SIMx08 GPS:
+      if ((net_fnbits & NET_FN_INTERNALGPS) != 0)
+        {
+        net_puts_rom(NET_WAKEUP_GPSON);
+        }
+      else
+        {
+        net_puts_rom(NET_WAKEUP_GPSOFF);
+        }
+#else
+      // Using external GPS from car:
       net_puts_rom(NET_WAKEUP);
+#endif
       break;
     case NET_STATE_DOINIT:
       if ((net_timeout_ticks % 3)==0)
@@ -1187,10 +1299,18 @@ void net_state_ticker1(void)
         led_set(OVMS_LED_RED,NET_LED_ERRCOPS);
         }
       break;
+    case NET_STATE_COPSWAIT:
+      if ((net_timeout_ticks % 10)==0)
+        {
+        delay100(2);
+        net_puts_rom(NET_CREG_STATUS);
+        while(vUARTIntTxBufDataCnt>0) { delay100(1); } // Wait for TX flush
+        delay100(2); // Wait for stable result
+        }
+      break;
     case NET_STATE_SOFTRESET:
       net_state_enter(NET_STATE_FIRSTRUN);
       break;
-
 
     case NET_STATE_READY:
 
@@ -1256,19 +1376,23 @@ void net_state_ticker1(void)
                 && (net_msg_serverok==1) && (net_msg_sendpending==0))
           {
           delay100(10);
+#ifndef OVMS_NO_VEHICLE_ALERTS
           if ((net_notify & NET_NOTIFY_NET_ALARM)>0)
             {
             net_notify &= ~(NET_NOTIFY_NET_ALARM); // Clear notification flag
             net_msg_alarm();
             return;
             }
-          else if ((net_notify & NET_NOTIFY_NET_CHARGE)>0)
+          else
+#endif //OVMS_NO_VEHICLE_ALERTS
+          if ((net_notify & NET_NOTIFY_NET_CHARGE)>0)
             {
             net_notify &= ~(NET_NOTIFY_NET_CHARGE); // Clear notification flag
             if (net_notify_suppresscount==0)
               {
               // execute CHARGE ALERT command:
               net_msg_cmd_code = 6;
+              net_msg_cmd_msg = cmd;
               net_msg_cmd_msg[0] = 0;
               net_msg_cmd_do();
               }
@@ -1280,12 +1404,14 @@ void net_state_ticker1(void)
             if (net_fnbits & NET_FN_12VMONITOR) net_msg_12v_alert();
             return;
             }
+#ifndef OVMS_NO_VEHICLE_ALERTS
           else if ((net_notify & NET_NOTIFY_NET_TRUNK)>0)
             {
             net_notify &= ~(NET_NOTIFY_NET_TRUNK); // Clear notification flag
             net_msg_valettrunk();
             return;
             }
+#endif //OVMS_NO_VEHICLE_ALERTS
           else if ((net_notify & NET_NOTIFY_NET_STAT)>0)
             {
             net_notify &= ~(NET_NOTIFY_NET_STAT); // Clear notification flag
@@ -1314,36 +1440,40 @@ void net_state_ticker1(void)
         if ((net_notify & NET_NOTIFY_SMSPART)>0)
           {
           delay100(10);
-          p = par_get(PARAM_REGPHONE);
+          net_assert_caller(NULL); // set net_caller to PARAM_REGPHONE
+#ifndef OVMS_NO_VEHICLE_ALERTS
           if ((net_notify & NET_NOTIFY_SMS_ALARM)>0)
             {
             net_notify &= ~(NET_NOTIFY_SMS_ALARM); // Clear notification flag
-            net_sms_alarm(p);
+            net_sms_alarm(net_caller);
             return;
             }
-          else if ((net_notify & NET_NOTIFY_SMS_CHARGE)>0)
+          else
+#endif //OVMS_NO_VEHICLE_ALERTS
+          if ((net_notify & NET_NOTIFY_SMS_CHARGE)>0)
             {
             net_notify &= ~(NET_NOTIFY_SMS_CHARGE); // Clear notification flag
             if (net_notify_suppresscount==0)
               {
-                char cmd[5];
-                strcpypgm2ram(cmd, "STAT");
-                net_sms_in(p, cmd, 4);
+                stp_rom(cmd, "STAT");
+                net_sms_in(net_caller, cmd);
               }
             return;
             }
           else if ((net_notify & NET_NOTIFY_SMS_12VLOW)>0)
             {
             net_notify &= ~(NET_NOTIFY_SMS_12VLOW); // Clear notification flag
-            if (net_fnbits & NET_FN_12VMONITOR) net_sms_12v_alert(p);
+            if (net_fnbits & NET_FN_12VMONITOR) net_sms_12v_alert(net_caller);
             return;
             }
+#ifndef OVMS_NO_VEHICLE_ALERTS
           else if ((net_notify & NET_NOTIFY_SMS_TRUNK)>0)
             {
             net_notify &= ~(NET_NOTIFY_SMS_TRUNK); // Clear notification flag
-            net_sms_valettrunk(p);
+            net_sms_valettrunk(net_caller);
             return;
             }
+#endif //OVMS_NO_VEHICLE_ALERTS
           else if ((net_notify & NET_NOTIFY_SMS_STAT)>0)
             {
             net_notify &= ~(NET_NOTIFY_SMS_STAT); // Clear notification flag
@@ -1485,26 +1615,37 @@ void net_state_ticker60(void)
     can_minSOCnotified &= ~CAN_MINSOC_ALERT_12V;
   }
 
-  // Check voltage if ref is valid and car is off:
-  if ((car_12vline_ref > BATT_12V_CALMDOWN_TIME) && !car_doors1bits.CarON)
+  // Check voltage if ref is valid:
+  if (car_12vline_ref > BATT_12V_CALMDOWN_TIME)
   {
-    // Info: healthy lead/acid discharge depth is ~ nom - 1.0 V
-    //        ref is ~ nom + 0.5 V
-
-    // Trigger 12V alert if voltage <= ref - 1.5 V:
-    if (!(can_minSOCnotified & CAN_MINSOC_ALERT_12V)
-            && (car_12vline <= (car_12vline_ref - 15)))
+    if (car_doors1bits.CarON)
     {
-      can_minSOCnotified |= CAN_MINSOC_ALERT_12V;
-      net_req_notification(NET_NOTIFY_12VLOW);
-    }
-
-    // Reset 12V alert if voltage >= ref - 1.3 V:
-    else if ((can_minSOCnotified & CAN_MINSOC_ALERT_12V)
-            && (car_12vline >= (car_12vline_ref - 13)))
-    {
+      // Reset 12V alert if car is on
+      // because DC/DC system charges 12V from main battery
       can_minSOCnotified &= ~CAN_MINSOC_ALERT_12V;
-      net_req_notification(NET_NOTIFY_12VLOW);
+    }
+    else
+    {
+      // Car is off, trigger alert if necessary
+
+      // Info: healthy lead/acid discharge depth is ~ nom - 1.0 V
+      //        ref is ~ nom + 0.5 V
+
+      // Trigger 12V alert if voltage <= ref - 1.6 V:
+      if (!(can_minSOCnotified & CAN_MINSOC_ALERT_12V)
+              && (car_12vline <= (car_12vline_ref - 16)))
+      {
+        can_minSOCnotified |= CAN_MINSOC_ALERT_12V;
+        net_req_notification(NET_NOTIFY_12VLOW);
+      }
+
+      // Reset 12V alert if voltage >= ref - 1.0 V:
+      else if ((can_minSOCnotified & CAN_MINSOC_ALERT_12V)
+              && (car_12vline >= (car_12vline_ref - 10)))
+      {
+        can_minSOCnotified &= ~CAN_MINSOC_ALERT_12V;
+        net_req_notification(NET_NOTIFY_12VLOW);
+      }
     }
   }
 

@@ -94,9 +94,10 @@
 #define NETINIT_CIICR        3
 #define NETINIT_CIPHEAD      4
 #define NETINIT_CIFSR        5
-#define NETINIT_CLPORT       6
-#define NETINIT_CIPSTART     7
-#define NETINIT_CONNECTING   8
+#define NETINIT_CDNSCFG      6
+#define NETINIT_CLPORT       7
+#define NETINIT_CIPSTART     8
+#define NETINIT_CONNECTING   9
 
 // NET data
 extern unsigned char net_state;                // The current state
@@ -164,6 +165,7 @@ extern unsigned char net_notify_suppresscount; // To suppress STAT notifications
 #define NET_NOTIFY_ALARM      NET_NOTIFY_NET_ALARM
 
 extern char net_scratchpad[NET_BUF_MAX];
+extern char net_buf[NET_BUF_MAX];
 
 void net_puts_rom(const rom char *data);
 void net_puts_ram(const char *data);
@@ -181,5 +183,7 @@ void net_state_ticker(void);
 
 void net_req_notification_error(unsigned int errorcode, unsigned long errordata);
 void net_req_notification(unsigned int notify);
+
+char *net_assert_caller(char *caller);
 
 #endif // #ifndef __OVMS_NET_H

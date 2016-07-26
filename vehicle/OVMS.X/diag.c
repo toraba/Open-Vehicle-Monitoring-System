@@ -132,6 +132,7 @@ void diag_ticker(void)
     net_puts_rom("\r\n# NOTIFY CHARGE ALERT\r\n");
     net_notify &= ~(NET_NOTIFY_NET_CHARGE|NET_NOTIFY_SMS_CHARGE);
     }
+#ifndef OVMS_NO_VEHICLE_ALERTS
   if (net_notify & (NET_NOTIFY_NET_TRUNK|NET_NOTIFY_SMS_TRUNK))
     {
     net_puts_rom("\r\n# NOTIFY TRUNK ALERT\r\n");
@@ -142,23 +143,16 @@ void diag_ticker(void)
     net_puts_rom("\r\n# NOTIFY ALARM ALERT\r\n");
     net_notify &= ~(NET_NOTIFY_NET_ALARM|NET_NOTIFY_SMS_ALARM);
     }
+#endif //OVMS_NO_VEHICLE_ALERTS
   }
 
 // These are the diagnostic command handlers
 
 void diag_handle_sms(char *command, char *arguments)
   {
-  char *p = par_get(PARAM_REGPHONE);
-  if (*p != 0)
-    {
-    strncpy(net_caller,p,NET_TEL_MAX);
-    }
-  else
-    {
-    strcpy(net_caller,(const char*)"OVMSDIAG");
-    }
   net_puts_rom("\r\n");
-  net_sms_in(net_caller,arguments,strlen(arguments));
+  net_assert_caller(NULL); // set net_caller to PARAM_REGPHONE
+  net_sms_in(net_caller,arguments);
   }
 
 void diag_handle_msg(char *command, char *arguments)
@@ -211,6 +205,7 @@ void diag_handle_diag(char *command, char *arguments)
   if (vehicle_version)
     s = stp_rom(s, vehicle_version);
   s = stp_i(s, "/V", hwv);
+  s = stp_rs(s, "/", OVMS_BUILDCONFIG);
   s = stp_rom(s, "\r\n");
   net_puts_ram(net_scratchpad);
 
@@ -218,11 +213,13 @@ void diag_handle_diag(char *command, char *arguments)
   s = stp_rom(s, "\r\n");
   net_puts_ram(net_scratchpad);
 
+#ifndef OVMS_NO_CRASHDEBUG
   s = stp_i(net_scratchpad, "#  CRASH:    ", debug_crashcnt);
   s = stp_i(s, " / ", debug_crashreason );
   s = stp_i(s, " / ", debug_checkpoint );
   s = stp_rom(s, "\r\n");
   net_puts_ram(net_scratchpad);
+#endif // OVMS_NO_CRASHDEBUG
 
   #ifdef OVMS_HW_V2
   x = inputs_voltage()*10;

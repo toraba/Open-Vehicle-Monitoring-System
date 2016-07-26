@@ -60,6 +60,7 @@
 #define PARAM_ACC_3       0x12
 #define PARAM_ACC_4       0x13
 
+#define PARAM_GPRSDNS     0x16
 #define PARAM_TIMEZONE    0x17
 
 #define PARAM_FEATURE_BASE 0x10
@@ -73,7 +74,11 @@
 #define PARAM_FEATURE14   0x1E
 #define PARAM_FEATURE15   0x1F
 
+extern char par_value[PARAM_MAX_LENGTH];
+
 void par_initialise(void);
+void par_read(unsigned char param);
+void par_write(unsigned char param);
 char* par_get(unsigned char param);
 void par_set(unsigned char param, char* value);
 void par_getbase64(unsigned char param, void* dest, size_t length);

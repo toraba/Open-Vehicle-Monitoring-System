@@ -22,6 +22,9 @@ use URI::Escape;
 use Data::UUID;
 use HTTP::Parser::XS qw(parse_http_request);
 use Socket qw(SOL_SOCKET SO_KEEPALIVE);
+use Email::MIME;
+use Email::Sender::Simple qw(sendmail);
+use POSIX qw(strftime);
 
 use constant SOL_TCP => 6;
 use constant TCP_KEEPIDLE => 4;
@@ -30,7 +33,7 @@ use constant TCP_KEEPCNT => 6;
 
 # Global Variables
 
-my $VERSION = "2.1.1-20121216";
+my $VERSION = "2.3.2-20160324";
 my $b64tab = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 my $itoa64 = './0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
 my %conns;
@@ -53,10 +56,9 @@ my @apns_queue_production;
 my @apns_queue;
 my $apns_handle;
 my $apns_running=0;
-my @c2dm_queue;
-my $c2dm_handle;
-my $c2dm_auth;
-my $c2dm_running=0;
+my @gcm_queue;
+my $gcm_running=0;
+my @mail_queue;
 
 # Auto-flush
 select STDERR; $|=1;
@@ -90,7 +92,11 @@ foreach (sort glob 'ovms_server*.vece')
 my $timeout_app      = $config->val('server','timeout_app',60*20);
 my $timeout_car      = $config->val('server','timeout_car',60*16);
 my $timeout_svr      = $config->val('server','timeout_svr',60*60);
+my $timeout_api      = $config->val('server','timeout_api',60*2);
 my $loghistory_tim   = $config->val('log','history',0);
+
+# User password encoding function:
+my $pw_encode        = $config->val('db','pw_encode','drupal_password($password)');
 
 # A database ticker
 $db = DBI->connect($config->val('db','path'),$config->val('db','user'),$config->val('db','pass'));
@@ -105,8 +111,17 @@ my $dbtim = AnyEvent->timer (after => 60, interval => 60, cb => \&db_tim);
 # An APNS ticker
 my $apnstim = AnyEvent->timer (after => 1, interval => 1, cb => \&apns_tim);
 
-# A C2DM ticker
-my $c2dmtim = AnyEvent->timer (after => 1, interval => 1, cb => \&c2dm_tim);
+# GCM ticker
+my $gcmtim = AnyEvent->timer (after => 1, interval => 1, cb => \&gcm_tim);
+
+# A MAIL ticker
+my $mail_enabled = $config->val('mail','enabled',0);
+my $mail_sender = $config->val('mail','sender','notifications@openvehicles.com');
+my $mail_interval = $config->val('mail','interval',10);
+if ($mail_enabled eq 1)
+  {
+  my $mailtim = AnyEvent->timer (after => $mail_interval, interval => $mail_interval, cb => \&mail_tim);
+  }
 
 # A utilisation ticker
 my $utiltim = AnyEvent->timer (after => 60, interval => 60, cb => \&util_tim);
@@ -313,6 +328,13 @@ sub io_line
 
     # Login...
     &io_login($fn,$hdl,$vehicleid,$clienttype,$rest);
+
+#    # Server IP migration
+#    if ((1)&&($clienttype eq 'C')&&($conns{$fn}{'host'} eq '54.243.136.230'))
+#      {
+#      AE::log info => "#$fn $clienttype $vehicleid requesting car server IP migration";
+#      &io_tx($fn, $hdl, 'C', '4,4,54.197.255.127');
+#      }
     }
   elsif ($line =~ /^AP-C\s+(\S)\s+(\S+)/)
     {
@@ -470,7 +492,7 @@ sub io_terminate
       }
     elsif ($conns{$fn}{'clienttype'} eq 'A')
       {
-      delete $app_conns{$vehicleid};
+      delete $app_conns{$vehicleid}{$fn};
       # Notify any listening cars
       my $cfn = $car_conns{$vehicleid};
       if (defined $cfn)
@@ -791,9 +813,9 @@ sub io_message
     if (($m_code eq $code)&&($data =~ /^(\d+)(,(.+))?$/)&&($1 == 30))
       {
       # Special case of an app requesting (non-paranoid) the GPRS data
-      my $sth = $db->prepare('SELECT vehicleid,left(h_timestamp,10) AS u_date,group_concat(h_data) AS data FROM ovms_historicalmessages '
-                           . 'WHERE vehicleid=? AND h_recordtype="*-OVM-Utilisation" '
-                           . 'GROUP BY vehicleid,u_date,h_recordtype ORDER BY h_timestamp desc,h_recordnumber LIMIT 90');
+      my $sth = $db->prepare('SELECT vehicleid,left(h_timestamp,10) AS u_date,group_concat(h_data ORDER BY h_recordnumber) AS data '
+                           . 'FROM ovms_historicalmessages WHERE vehicleid=? AND h_recordtype="*-OVM-Utilisation" '
+                           . 'GROUP BY vehicleid,u_date,h_recordtype ORDER BY h_timestamp desc LIMIT 90');
       $sth->execute($vehicleid);
       my $rows = $sth->rows;
       my $k = 0;
@@ -812,9 +834,11 @@ sub io_message
     elsif (($m_code eq $code)&&($data =~ /^(\d+)(,(.+))?$/)&&($1 == 31))
       {
       # Special case of an app requesting (non-paranoid) the historical data summary
+      my ($h_since) = $3;
+      $h_since='0000-00-00' if (!defined $h_since);
       my $sth = $db->prepare('SELECT h_recordtype,COUNT(DISTINCT h_recordnumber) AS distinctrecs, COUNT(*) AS recs,SUM(LENGTH(h_recordtype)+LENGTH(h_data)+LENGTH(vehicleid)+20) AS tsize, MIN(h_timestamp) AS first, MAX(h_timestamp) AS last '
-                           . 'FROM ovms_historicalmessages WHERE vehicleid=? GROUP BY h_recordtype ORDER BY h_recordtype;');
-      $sth->execute($vehicleid);
+                           . 'FROM ovms_historicalmessages WHERE vehicleid=? AND h_timestamp>? GROUP BY h_recordtype ORDER BY h_recordtype;');
+      $sth->execute($vehicleid,$h_since);
       my $rows = $sth->rows;
       my $k = 0;
       while (my $row = $sth->fetchrow_hashref())
@@ -837,9 +861,10 @@ sub io_message
     elsif (($m_code eq $code)&&($data =~ /^(\d+)(,(.+))?$/)&&($1 == 32))
       {
       # Special case of an app requesting (non-paranoid) the GPRS data
-      my ($h_recordtype) = $3;
-      my $sth = $db->prepare('SELECT * FROM ovms_historicalmessages WHERE vehicleid=? AND h_recordtype=? ORDER BY h_timestamp,h_recordnumber');
-      $sth->execute($vehicleid,$h_recordtype);
+      my ($h_recordtype,$h_since) = split /,/,$3,2;
+      $h_since='0000-00-00' if (!defined $h_since);
+      my $sth = $db->prepare('SELECT * FROM ovms_historicalmessages WHERE vehicleid=? AND h_recordtype=? AND h_timestamp>? ORDER BY h_timestamp,h_recordnumber');
+      $sth->execute($vehicleid,$h_recordtype,$h_since);
       my $rows = $sth->rows;
       my $k = 0;
       while (my $row = $sth->fetchrow_hashref())
@@ -953,6 +978,13 @@ sub io_message
             undef,
             $vehicleid, $m_code, $m_paranoid, $ptoken, $m_data,
             $m_paranoid, $ptoken, $m_data);
+    if ($loghistory_tim > 0)
+      {
+      $db->do("INSERT IGNORE INTO ovms_historicalmessages (vehicleid,h_timestamp,h_recordtype,h_recordnumber,h_data,h_expires) "
+          . "VALUES (?,UTC_TIMESTAMP(),?,?,?,UTC_TIMESTAMP()+INTERVAL ? SECOND)",
+            undef,
+            $vehicleid, $m_code, 0, $m_data, $loghistory_tim);
+      }
     $db->do("UPDATE ovms_cars SET v_lastupdate=UTC_TIMESTAMP() WHERE vehicleid=?",undef,$vehicleid);
     # And send it on to the apps...
     AE::log info => "#$fn $clienttype $vehicleid msg handle $m_code $m_data";
@@ -1173,6 +1205,7 @@ sub svr_timeout
 sub push_queuenotify
   {
   my ($vehicleid, $alerttype, $alertmsg) = @_;
+  my $timestamp = strftime "%Y-%m-%d %H:%M:%S", gmtime;
 
   if ($alerttype eq 'E')
     {
@@ -1189,14 +1222,34 @@ sub push_queuenotify
     $rec{'vehicleid'} = $vehicleid;
     $rec{'alerttype'} = $alerttype;
     $rec{'alertmsg'} = $alertmsg;
+    $rec{'timestamp'} = $timestamp;
     $rec{'pushkeytype'} = $row->{'pushkeytype'};
     $rec{'pushkeyvalue'} = $row->{'pushkeyvalue'};
     $rec{'appid'} = $row->{'appid'};
+    
+    # send mail notifications:
+    if ($row->{'pushtype'} eq 'mail' && $mail_enabled eq 1)
+      {
+      push @mail_queue,\%rec;
+      AE::log info => "- - $vehicleid msg queued mail notification for $rec{'pushkeyvalue'}";
+      }
+    
+    # send Google push notification:
+    if ($row->{'pushtype'} eq 'gcm')
+      {
+      push @gcm_queue,\%rec;
+      AE::log info => "- - $vehicleid msg queued gcm notification for $rec{'pushkeytype'}:$rec{'appid'}";
+      }
+    }
+    
+    # check active connections:
     foreach (%{$app_conns{$vehicleid}})
       {
       my $fn = $_;
       next CANDIDATE if ($conns{$fn}{'appid'} eq $row->{'appid'}); # Car connected?
       }
+    
+    # send Apple push notification:
     if ($row->{'pushtype'} eq 'apns')
       {
       if ($row->{'pushkeytype'} eq 'sandbox')
@@ -1205,12 +1258,6 @@ sub push_queuenotify
         { push @apns_queue_production,\%rec; }
       AE::log info => "- - $vehicleid msg queued apns notification for $rec{'pushkeytype'}:$rec{'appid'}";
       }
-    if ($row->{'pushtype'} eq 'c2dm')
-      {
-      push @c2dm_queue,\%rec;
-      AE::log info => "- - $vehicleid msg queued c2dm notification for $rec{'pushkeytype'}:$rec{'appid'}";
-      }
-    }
   }
 
 sub vece_expansion
@@ -1366,73 +1413,74 @@ sub apns_tim
     }
   }
 
-sub c2dm_tim
+sub gcm_tim
   {
-  if (($c2dm_running == 0)&&(!defined $c2dm_auth))
-    {
-    return if (scalar @c2dm_queue == 0);
+  return if ($gcm_running);
+  return if (scalar @gcm_queue == 0);
 
-    # OK. First step is we need to get an AUTH token...
-    $c2dm_running = 1;
-    $c2dm_auth = undef;
-    my $c2dm_email = uri_escape($config->val('c2dm','email'));
-    my $c2dm_password = uri_escape($config->val('c2dm','password'));
-    my $c2dm_type = uri_escape($config->val('c2dm','accounttype'));
-    my $body = 'Email='.$c2dm_email.'&Passwd='.$c2dm_password.'&accountType='.$c2dm_type.'&source=openvehicles-ovms-1&service=ac2dm';
-    AE::log info => "- - - msg c2dm obtaining auth token for notifications";
+  my $apikey = $config->val('gcm','apikey');
+  return if ((!defined $apikey)||($apikey eq ''));
+
+  AE::log info => "- - - msg gcm processing queue";
+  $gcm_running = 1;
+
+  foreach my $rec (@gcm_queue)
+    {
+    my $vehicleid = $rec->{'vehicleid'};
+    my $alerttype = $rec->{'alerttype'};
+    my $alertmsg = $rec->{'alertmsg'};
+    my $timestamp = $rec->{'timestamp'};
+    my $pushkeyvalue = $rec->{'pushkeyvalue'};
+    my $appid = $rec->{'appid'};
+    AE::log info => "#$fn - $vehicleid msg gcm '$alertmsg' => $pushkeyvalue";
+    my $body = 'registration_id='.uri_escape($pushkeyvalue)
+              .'&data.title='.uri_escape($vehicleid)
+              .'&data.message='.uri_escape($alertmsg)
+              .'&data.time='.uri_escape($timestamp)
+              .'&collapse_key='.time;
     http_request
-      POST => 'https://www.google.com/accounts/ClientLogin',
+      POST=>'https://android.googleapis.com/gcm/send',
       body => $body,
-      headers=>{ "Content-Type" => "application/x-www-form-urlencoded" },
+      headers=>{ 'Authorization' => 'key='.$apikey,
+                 "Content-Type" => "application/x-www-form-urlencoded" },
       sub
         {
         my ($data, $headers) = @_;
         foreach (split /\n/,$data)
-          {
-          $c2dm_auth = $1 if (/^Auth=(.+)/);
-          }
-        if (!defined $c2dm_auth)
-          {
-          AE::log error => "- - - msg c2dm could not authenticate to google ($body)";
-          @c2dm_queue = ();
-          $c2dm_running = 0;
-          return;
-          }
-        $c2dm_running = 2;
+          { AE::log info => "- - - msg gcm message sent ($_)"; }
         };
     }
-  elsif (($c2dm_running == 2)||(($c2dm_running==0)&&(defined $c2dm_auth)&&(scalar @c2dm_queue > 0)))
-    {
-    $c2dm_running = 2;
-    AE::log info => "- - - msg c2dm auth is '$c2dm_auth'";
+  @gcm_queue = ();
+  $gcm_running = 0;
+  }
 
-    foreach my $rec (@c2dm_queue)
+sub mail_tim
+  {
+  foreach my $rec (@mail_queue)
+    {
+    my $vehicleid = $rec->{'vehicleid'};
+    my $alerttype = $rec->{'alerttype'};
+    my $alertmsg = $rec->{'alertmsg'};
+    my $pushkeyvalue = $rec->{'pushkeyvalue'};
+    if ($pushkeyvalue =~ /@/)
       {
-      my $vehicleid = $rec->{'vehicleid'};
-      my $alerttype = $rec->{'alerttype'};
-      my $alertmsg = $rec->{'alertmsg'};
-      my $pushkeyvalue = $rec->{'pushkeyvalue'};
-      my $appid = $rec->{'appid'};
-      AE::log info => "#$fn - $vehicleid msg c2dm '$alertmsg' => $pushkeyvalue";
-      my $body = 'registration_id='.uri_escape($pushkeyvalue)
-                .'&data.title='.uri_escape($vehicleid)
-                .'&data.message='.uri_escape($alertmsg)
-                .'&collapse_key='.time;
-      http_request
-        POST=>'https://android.apis.google.com/c2dm/send',
-        body => $body,
-        headers=>{ 'Authorization' => 'GoogleLogin auth='.$c2dm_auth,
-                   "Content-Type" => "application/x-www-form-urlencoded" },
-        sub
-          {
-          my ($data, $headers) = @_;
-          foreach (split /\n/,$data)
-            { AE::log info => "- - - msg c2dm message sent ($_)"; }
-          };
+      AE::log info => "#$fn - $vehicleid msg mail '$alertmsg' => '$pushkeyvalue'";
+      my $message = Email::MIME->create(
+        header_str => [
+          From    => $mail_sender,
+          To      => $pushkeyvalue,
+          Subject => "OVMS notification from $vehicleid",
+        ],
+        attributes => {
+          encoding => 'quoted-printable',
+          charset  => 'ISO-8859-1',
+        },
+        body_str => $alertmsg,
+      );
+      sendmail($message);
       }
-    @c2dm_queue = ();
-    $c2dm_running = 0;
     }
+  @mail_queue = ();
   }
 
 sub http_request_in_root
@@ -1463,7 +1511,8 @@ sub http_request_api_cookie_login
     if (defined $row)
       {
       my $passwordhash = $row->{'pass'};
-      if (&drupal_password_check($passwordhash, $password))
+      my $encoded = eval $pw_encode;
+      if ($encoded eq $passwordhash)
         {
         # Password ok
         my $ug = new Data::UUID;
@@ -1613,12 +1662,19 @@ sub http_request_api_status
       }
     my ($soc,$units,$linevoltage,$chargecurrent,$chargestate,$chargemode,$idealrange,$estimatedrange,
         $chargelimit,$chargeduration,$chargeb4,$chargekwh,$chargesubstate,$chargestateN,$chargemodeN,
-        $chargetimer,$chargestarttime,$chargetimerstale) = split /,/,$rec->{'m_msg'};
+        $chargetimer,$chargestarttime,$chargetimerstale,$cac100,
+		$charge_etr_full,$charge_etr_limit,$charge_limit_range,$charge_limit_soc,
+		$cooldown_active,$cooldown_tbattery,$cooldown_timelimit,
+		$charge_estimate,$charge_etr_range,$charge_etr_soc,$idealrange_max) = split /,/,$rec->{'m_msg'};
     $result{'soc'} = $soc;
     $result{'units'} = $units;
     $result{'idealrange'} = $idealrange;
+    $result{'idealrange_max'} = $idealrange_max;
     $result{'estimatedrange'} = $estimatedrange,
     $result{'mode'} = $chargemode;
+    $result{'chargestate'} = $chargestate;
+    $result{'cac100'} = $cac100;
+    $result{'cooldown_active'} = $cooldown_active;
     }
   $rec= &api_vehiclerecord($vehicleid,'D');
   if (defined $rec)
@@ -1626,7 +1682,7 @@ sub http_request_api_status
     if (! $rec->{'m_paranoid'})
       {
       my ($doors1,$doors2,$lockunlock,$tpem,$tmotor,$tbattery,$trip,$odometer,$speed,$parktimer,$ambient,
-          $doors3,$staletemps,$staleambient,$vehicle12v,$doors4) = split /,/,$rec->{'m_msg'};
+          $doors3,$staletemps,$staleambient,$vehicle12v,$doors4,$vehicle12v_ref,$doors5,$tcharger) = split /,/,$rec->{'m_msg'};
       $result{'fl_dooropen'} =   $doors1 & 0b00000001;
       $result{'fr_dooropen'} =   $doors1 & 0b00000010;
       $result{'cp_dooropen'} =   $doors1 & 0b00000100;
@@ -1641,6 +1697,7 @@ sub http_request_api_status
       $result{'temperature_pem'} = $tpem;
       $result{'temperature_motor'} = $tmotor;
       $result{'temperature_battery'} = $tbattery;
+      $result{'temperature_charger'} = $tcharger;
       $result{'tripmeter'} = $trip;
       $result{'odometer'} = $odometer;
       $result{'speed'} = $speed;
@@ -1649,7 +1706,9 @@ sub http_request_api_status
       $result{'carawake'} =      $doors3 & 0b00000010;
       $result{'staletemps'} = $staletemps;
       $result{'staleambient'} = $staleambient;
+      $result{'charging_12v'} =  $doors5 & 0b00010000;
       $result{'vehicle12v'} = $vehicle12v;
+      $result{'vehicle12v_ref'} = $vehicle12v_ref;
       $result{'alarmsounding'} = $doors4 & 0b00000100;
       }
     }
@@ -1770,7 +1829,10 @@ sub http_request_api_charge_get
       }
     my ($soc,$units,$linevoltage,$chargecurrent,$chargestate,$chargemode,$idealrange,$estimatedrange,
         $chargelimit,$chargeduration,$chargeb4,$chargekwh,$chargesubstate,$chargestateN,$chargemodeN,
-        $chargetimer,$chargestarttime,$chargetimerstale) = split /,/,$rec->{'m_msg'};
+        $chargetimer,$chargestarttime,$chargetimerstale,$cac100,
+		$charge_etr_full,$charge_etr_limit,$charge_limit_range,$charge_limit_soc,
+		$cooldown_active,$cooldown_tbattery,$cooldown_timelimit,
+		$charge_estimate,$charge_etr_range,$charge_etr_soc,$idealrange_max) = split /,/,$rec->{'m_msg'};
     $result{'linevoltage'} = $linevoltage;
     $result{'chargecurrent'} = $chargecurrent;
     $result{'chargestate'} = $chargestate;
@@ -1785,6 +1847,18 @@ sub http_request_api_charge_get
     $result{'chargetimermode'} = $chargetimer;
     $result{'chargestarttime'} = $chargestarttime;
     $result{'chargetimerstale'} = $chargetimerstale;
+    $result{'cac100'} = $cac100;
+    $result{'charge_etr_full'} = $charge_etr_full;
+    $result{'charge_etr_limit'} = $charge_etr_limit;
+    $result{'charge_limit_range'} = $charge_limit_range;
+    $result{'charge_limit_soc'} = $charge_limit_soc;
+    $result{'cooldown_active'} = $cooldown_active;
+    $result{'cooldown_tbattery'} = $cooldown_tbattery;
+    $result{'cooldown_timelimit'} = $cooldown_timelimit;
+    $result{'charge_estimate'} = $charge_estimate;
+    $result{'charge_etr_rang'} = $charge_etr_range;
+    $result{'charge_etr_soc'} = $charge_etr_soc;
+    $result{'idealrange_max'} = $idealrange_max;
     }
   $rec= &api_vehiclerecord($vehicleid,'D');
   if (defined $rec)
@@ -1792,7 +1866,7 @@ sub http_request_api_charge_get
     if (! $rec->{'m_paranoid'})
       {
       my ($doors1,$doors2,$lockunlock,$tpem,$tmotor,$tbattery,$trip,$odometer,$speed,$parktimer,$ambient,
-          $doors3,$staletemps,$staleambient,$vehicle12v,$doors4) = split /,/,$rec->{'m_msg'};
+          $doors3,$staletemps,$staleambient,$vehicle12v,$doors4,$vehicle12v_ref,$doors5,$tcharger) = split /,/,$rec->{'m_msg'};
       $result{'cp_dooropen'} =   $doors1 & 0b00000100;
       $result{'pilotpresent'} =  $doors1 & 0b00001000;
       $result{'charging'} =      $doors1 & 0b00010000;
@@ -1800,10 +1874,14 @@ sub http_request_api_charge_get
       $result{'temperature_pem'} = $tpem;
       $result{'temperature_motor'} = $tmotor;
       $result{'temperature_battery'} = $tbattery;
+      $result{'temperature_charger'} = $tcharger;
       $result{'temperature_ambient'} = $ambient;
       $result{'carawake'} =      $doors3 & 0b00000010;
       $result{'staletemps'} = $staletemps;
       $result{'staleambient'} = $staleambient;
+      $result{'charging_12v'} =  $doors5 & 0b00010000;
+      $result{'vehicle12v'} = $vehicle12v;
+      $result{'vehicle12v_ref'} = $vehicle12v_ref;
       }
     }
 
@@ -2071,7 +2149,7 @@ sub api_tim
   foreach my $session (keys %api_conns)
     {
     my $lastused = $api_conns{$session}{'sessionused'};
-    my $expire = AnyEvent->now - 120;
+    my $expire = AnyEvent->now - $timeout_api;
 
     if ($lastused < $expire)
       {
@@ -2239,9 +2317,9 @@ EOT
   $httpd->stop_request;
   }
 
-sub drupal_password_check
+sub drupal_password
   {
-  my ($ph,$password) = @_;
+  my ($password) = @_;
 
   my $iter_log2 = index($itoa64,substr($ph,3,1));
   my $iter_count = 1 << $iter_log2;
@@ -2258,7 +2336,7 @@ sub drupal_password_check
 
   my $encoded = substr($phash . &drupal_password_base64_encode($hash,length($hash)),0,55);
 
-  return ($encoded eq $ph);
+  return $encoded;
   }
 
 sub drupal_password_base64_encode

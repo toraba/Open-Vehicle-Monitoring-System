@@ -92,8 +92,10 @@ rom char NET_MSG_CMDOK[] = ",0";
 rom char NET_MSG_CMDINVALIDSYNTAX[] = ",1,Invalid syntax";
 rom char NET_MSG_CMDNOCANWRITE[] = ",1,No write access to CAN";
 rom char NET_MSG_CMDINVALIDRANGE[] = ",1,Parameter out of range";
+#ifndef OVMS_NO_CHARGECONTROL
 rom char NET_MSG_CMDNOCANCHARGE[] = ",1,Cannot charge (charge port closed)";
 rom char NET_MSG_CMDNOCANSTOPCHARGE[] = ",1,Cannot stop charge (charge not in progress)";
+#endif // OVMS_NO_CHARGECONTROL
 rom char NET_MSG_CMDUNIMPLEMENTED[] = ",3";
 
 
@@ -172,7 +174,7 @@ void net_msg_encode_puts(void)
       k=strlen(net_msg_scratchpad);
       RC4_crypt(&pm_crypto1, &pm_crypto2, net_msg_scratchpad, k);
 
-      strcpypgm2ram(net_scratchpad,(char const rom far*)"MP-0 EM");
+      stp_rom(net_scratchpad,(char const rom far*)"MP-0 EM");
       net_scratchpad[7] = code;
       base64encode(net_msg_scratchpad,k,net_scratchpad+8);
       // The messdage is now in paranoid mode...
@@ -344,13 +346,24 @@ char net_msgp_stat(char stat)
   s = stp_i(s, ",", car_stale_timer);
   s = stp_l2f(s, ",", (unsigned long)car_cac100, 2);
   s = stp_i(s, ",", car_chargefull_minsremaining);
-  s = stp_i(s, ",", car_chargelimit_minsremaining);
-  s = stp_i(s, ",", car_chargelimit_rangelimit);
+  s = stp_i(s, ",",
+            ((car_chargelimit_minsremaining_range >= 0)
+          && (car_chargelimit_minsremaining_range < car_chargelimit_minsremaining_soc))
+          ? car_chargelimit_minsremaining_range
+          : car_chargelimit_minsremaining_soc); // ETR for first limit reached
+  s = stp_i(s, ",", (*p == 'M')
+          ? car_chargelimit_rangelimit
+          : KmFromMi(car_chargelimit_rangelimit));
   s = stp_i(s, ",", car_chargelimit_soclimit);
   s = stp_i(s, ",", car_coolingdown);
   s = stp_i(s, ",", car_cooldown_tbattery);
   s = stp_i(s, ",", car_cooldown_timelimit);
   s = stp_i(s, ",", car_chargeestimate);
+  s = stp_i(s, ",", car_chargelimit_minsremaining_range);
+  s = stp_i(s, ",", car_chargelimit_minsremaining_soc);
+  s = stp_i(s, ",", (*p == 'M')
+          ? car_max_idealrange
+          : KmFromMi(car_max_idealrange));
 
   return net_msg_encode_statputs(stat, &crc_stat);
 }
@@ -414,7 +427,10 @@ char net_msgp_firmware(char stat)
   s = stp_i(s, ".", ovms_firmware[1]);
   s = stp_i(s, ".", ovms_firmware[2]);
   s = stp_s(s, "/", par_get(PARAM_VEHICLETYPE));
+  if (vehicle_version)
+    s = stp_rom(s, vehicle_version);
   s = stp_i(s, "/V", hwv);
+  s = stp_rs(s, "/", OVMS_BUILDCONFIG);
   s = stp_s(s, ",", car_vin);
   s = stp_i(s, ",", net_sq);
   s = stp_i(s, ",", sys_features[FEATURE_CANWRITE]);
@@ -440,9 +456,9 @@ char net_msgp_environment(char stat)
   s = stp_i(s, ",", car_tpem);
   s = stp_i(s, ",", car_tmotor);
   s = stp_i(s, ",", car_tbattery);
-  s = stp_i(s, ",", car_trip);
-  s = stp_ul(s, ",", car_odometer);
-  s = stp_i(s, ",", car_speed);
+  s = stp_i(s, ",", (can_mileskm=='M') ? car_trip : KmFromMi(car_trip));
+  s = stp_ul(s, ",", (can_mileskm=='M') ? car_odometer : KmFromMi(car_odometer));
+  s = stp_i(s, ",", car_speed); // no conversion, stored in user unit
   s = stp_ul(s, ",", park);
   s = stp_i(s, ",", car_ambient_temp);
   s = stp_i(s, ",", car_doors3);
@@ -452,6 +468,7 @@ char net_msgp_environment(char stat)
   s = stp_i(s, ",", car_doors4);
   s = stp_l2f(s, ",", car_12vline_ref, 1);
   s = stp_i(s, ",", car_doors5);
+  s = stp_i(s, ",", car_tcharger);
 
   return net_msg_encode_statputs(stat, &crc_environment);
 }
@@ -558,7 +575,7 @@ void net_msg_server_welcome(char *msg)
 
     // To be truly paranoid, we must send the paranoid token to the server ;-)
     ptokenmade=0; // Leave it off for the MP-0 ET message
-    strcpypgm2ram(net_scratchpad,(char const rom far*)"MP-0 ET");
+    stp_rom(net_scratchpad,(char const rom far*)"MP-0 ET");
     strcat(net_scratchpad,ptoken);
     net_msg_start();
     net_msg_encode_puts();
@@ -575,6 +592,7 @@ void net_msg_server_welcome(char *msg)
   }
 
 
+#ifndef OVMS_NO_CRASHDEBUG
   /* DEBUG / QA stats: Send crash counter and last reason:
    *
    * MP-0 H*-OVM-DebugCrash,0,2592000
@@ -602,6 +620,9 @@ void net_msg_server_welcome(char *msg)
     net_msg_encode_puts();
     net_msg_send();
     }
+#endif // OVMS_NO_CRASHDEBUG
+
+
 #ifdef OVMS_LOGGINGMODULE
   logging_serverconnect();
 #endif // #ifdef OVMS_LOGGINGMODULE
@@ -611,7 +632,6 @@ void net_msg_server_welcome(char *msg)
 void net_msg_in(char* msg)
   {
   int k;
-  char s;
 
   if (net_msg_serverok == 0)
     {
@@ -624,17 +644,6 @@ void net_msg_in(char* msg)
     }
 
   // Ok, we've got an encrypted message waiting for work.
-  // The following is a nasty hack because base64decode doesn't like incoming
-  // messages of length divisible by 4, and is really expecting a CRLF
-  // terminated string, so we give it one...
-  CHECKPOINT(0x40)
-  if (((strlen(msg)*4)/3) >= (NET_BUF_MAX-3))
-    {
-    // Quick exit to reset link if incoming message is too big
-    net_state_enter(NET_STATE_DONETINIT);
-    return;
-    }
-  strcatpgm2ram(msg,(char const rom far*)"\r\n");
   k = base64decode(msg,net_scratchpad);
   CHECKPOINT(0x41)
   RC4_crypt(&rx_crypto1, &rx_crypto2, net_scratchpad, k);
@@ -648,11 +657,7 @@ void net_msg_in(char* msg)
   if ((*msg == 'E')&&(msg[1]=='M'))
     {
     // A paranoid-mode message from the server (or, more specifically, app)
-    // The following is a nasty hack because base64decode doesn't like incoming
-    // messages of length divisible by 4, and is really expecting a CRLF
-    // terminated string, so we give it one...
     msg += 2; // Now pointing to the code just before encrypted paranoid message
-    strcatpgm2ram(msg,(char const rom far*)"\r\n");
     k = base64decode(msg+1,net_msg_scratchpad+1);
     RC4_setup(&pm_crypto1, &pm_crypto2, pdigest, MD5_SIZE);
     for (k=0;k<1024;k++)
@@ -670,7 +675,7 @@ void net_msg_in(char* msg)
   switch (*msg)
     {
     case 'A': // PING
-      strcpypgm2ram(net_scratchpad,(char const rom far*)"MP-0 a");
+      stp_rom(net_scratchpad,(char const rom far*)"MP-0 a");
       if (net_msg_sendpending==0)
         {
         net_msg_start();
@@ -714,7 +719,6 @@ void net_msg_cmd_in(char* msg)
   {
   // We have received a command message (pointed to by <msg>)
   char *d;
-  int k;
 
   for (d=msg;(*d != 0)&&(*d != ',');d++) ;
   if (*d == ',')
@@ -726,7 +730,7 @@ void net_msg_cmd_in(char* msg)
 
 BOOL net_msg_cmd_exec(void)
   {
-  int k;
+  UINT8 k;
   char *p, *s;
 
   delay100(2);
@@ -793,7 +797,9 @@ BOOL net_msg_cmd_exec(void)
         *p++ = 0;
         // At this point, <net_msg_cmd_msg> points to the command, and <p> to the param value
         k = atoi(net_msg_cmd_msg);
-        if ((k>=0)&&(k<PARAM_FEATURE_S))
+        // Check validity of param key and value (no empty value allowed for auth params):
+        if ( (k>=0) && (k<PARAM_FEATURE_S)
+                && ((k>PARAM_MODULEPASS) || (*p!=0)) )
           {
           par_set(k, p);
           STP_OK(net_scratchpad, net_msg_cmd_code);
@@ -824,6 +830,46 @@ BOOL net_msg_cmd_exec(void)
 
     case 6: // CHARGE ALERT (params unused)
       net_msg_alert();
+      net_msg_encode_puts();
+      break;
+
+    case 7: // SMS command wrapper
+
+      // copy command to net_msg_scratchpad:
+      //    !!! ATT: net_msg_scratchpad MUST NOT be used
+      //    !!! in command handler prior to parameter parsing!
+      stp_ram(net_msg_scratchpad, net_msg_cmd_msg);
+      
+      // redirect command output into net_buf[]:
+      net_msg_bufpos = net_buf;
+      
+      // process command:
+      net_assert_caller(NULL); // set net_caller to PARAM_REGPHONE
+      k = net_sms_in(net_caller, net_msg_scratchpad);
+      
+      // terminate output redirection:
+      *net_msg_bufpos = 0;
+      net_msg_bufpos = NULL;
+      
+      // create return string:
+      s = stp_i(net_scratchpad, NET_MSG_CMDRESP, net_msg_cmd_code);
+      s = stp_i(s, ",", 1-k); // 0=ok 1=error
+      if (k)
+        {
+        *s++ = ',';
+        for (p = net_buf; *p; p++)
+          {
+            if (*p == '\n')
+              *s++ = '\r'; // translate LF to CR
+            else if (*p == ',')
+              *s++ = ';'; // translate , to ;
+            else
+              *s++ = *p;
+          }
+        *s = 0;
+        }
+
+      // send return string:
       net_msg_encode_puts();
       break;
 
@@ -872,7 +918,8 @@ BOOL net_msg_cmd_exec(void)
       net_msg_encode_puts();
       delay100(2);
       break;
-    default:
+
+  default:
       return FALSE;
     }
 
@@ -930,11 +977,13 @@ void net_msg_forward_sms(char *caller, char *SMS)
 
   delay100(2);
   net_msg_start();
-  strcpypgm2ram(net_scratchpad,(char const rom far*)"MP-0 PA");
+  stp_rom(net_scratchpad,(char const rom far*)"MP-0 PA");
   strcatpgm2ram(net_scratchpad,(char const rom far*)"SMS FROM: ");
-  strcat(net_scratchpad, caller);
+  strcat(net_scratchpad, caller); // max 19 chars
   strcatpgm2ram(net_scratchpad,(char const rom far*)" - MSG: ");
-  SMS[170]=0; // Hacky limit on the max size of an SMS forwarded
+  // scratchpad max 199 chars, rom strings 25 + caller 19 = 44 chars
+  // => max payload = 155 chars
+  SMS[155]=0; // Hacky limit on the max size of an SMS forwarded
   strcat(net_scratchpad, SMS);
   net_msg_encode_puts();
   net_msg_send();
@@ -1069,14 +1118,14 @@ char *net_prep_stat(char *s)
       if (car_chargelimit_soclimit > 0)
         {
         s = stp_i(s, "\r ", car_chargelimit_soclimit);
-        s = stp_i(s,"%: ",car_chargelimit_minsremaining);
+        s = stp_i(s,"%: ",car_chargelimit_minsremaining_soc);
         s = stp_rom(s," mins");
         }
       if (car_chargelimit_rangelimit > 0)
         {
         s = stp_i(s, "\r ", (can_mileskm == 'K')?KmFromMi(car_chargelimit_rangelimit):car_chargelimit_rangelimit);
         s = stp_rom(s, unit);
-        s = stp_i(s,": ",car_chargelimit_minsremaining);
+        s = stp_i(s,": ",car_chargelimit_minsremaining_range);
         s = stp_rom(s," mins");
         }
     }
@@ -1112,6 +1161,7 @@ char *net_prep_stat(char *s)
   return s;
 }
 
+#ifndef OVMS_NO_CTP
 char *net_prep_ctp(char *s, char *argument)
 {
   int imStart = car_idealrange;
@@ -1221,6 +1271,7 @@ char *net_prep_ctp(char *s, char *argument)
     }
   return s;
 }
+#endif //OVMS_NO_CTP
 
 void net_msg_alert(void)
 {
@@ -1232,13 +1283,14 @@ void net_msg_alert(void)
   net_prep_stat(s);
 }
 
+#ifndef OVMS_NO_VEHICLE_ALERTS
 void net_msg_alarm(void)
   {
   char *p;
 
   delay100(2);
   net_msg_start();
-  strcpypgm2ram(net_scratchpad,(char const rom far*)"MP-0 PAVehicle alarm is sounding!");
+  stp_rom(net_scratchpad,(char const rom far*)"MP-0 PAVehicle alarm is sounding!");
   net_msg_encode_puts();
   net_msg_send();
   }
@@ -1249,10 +1301,11 @@ void net_msg_valettrunk(void)
 
   delay100(2);
   net_msg_start();
-  strcpypgm2ram(net_scratchpad,(char const rom far*)"MP-0 PATrunk has been opened (valet mode).");
+  stp_rom(net_scratchpad,(char const rom far*)"MP-0 PATrunk has been opened (valet mode).");
   net_msg_encode_puts();
   net_msg_send();
   }
+#endif //OVMS_NO_VEHICLE_ALERTS
 
 void net_msg_socalert(void)
   {

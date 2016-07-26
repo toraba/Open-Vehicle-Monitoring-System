@@ -376,6 +376,19 @@ void cr2lf(char *s)
 }
 
 
+// string prefix check:
+
+BOOL starts_with(char *s, const rom char *pfx)
+{
+  while ((*s == *pfx) && (*pfx != 0))
+  {
+    pfx++;
+    s++;
+  }
+  return (*pfx == 0);
+}
+
+
 // string-print rom string:
 
 char *stp_rom(char *dst, const rom char *val)
@@ -399,6 +412,15 @@ char *stp_s(char *dst, const rom char *prefix, char *val)
   if (prefix)
     dst = stp_rom(dst, prefix);
   return stp_ram(dst, val);
+}
+
+// string-print rom string with optional prefix:
+
+char *stp_rs(char *dst, const rom char *prefix, const rom char *val)
+{
+  if (prefix)
+    dst = stp_rom(dst, prefix);
+  return stp_rom(dst, val);
 }
 
 // string-print integer with optional string prefix:
@@ -519,7 +541,7 @@ char *stp_l2f(char *dst, const rom char *prefix, long val, int prec)
 
   dst = stp_l(dst, prefix, val / factor);
   *dst++ = '.';
-  dst = stp_ulp(dst, NULL, val % factor, prec, '0');
+  dst = stp_ulp(dst, NULL, ABS(val) % factor, prec, '0');
 
   return dst;
 }
@@ -582,6 +604,9 @@ char *stp_latlon(char *dst, const rom char *prefix, long latlon)
   return stp_l2f(dst, NULL, res * 1000000, 6);
 }
 
+
+#ifndef OVMS_NO_SMSTIME
+
 char *stp_time(char *dst, const rom char *prefix, unsigned long timestamp)
 {
   char *start, *end;
@@ -625,6 +650,9 @@ char *stp_date(char *dst, const rom char *prefix, unsigned long timestamp)
   dst = stp_ulp(dst, "-", month, 2, '0');
   return stp_ulp(dst, "-", day, 2, '0');
   }
+
+#endif //OVMS_NO_SMSTIME
+
 
 char *stp_mode(char *dst, const rom char *prefix, unsigned char mode)
   {
